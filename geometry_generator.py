@@ -44,6 +44,10 @@ _setup_font()
 _PROJ_ANGLE = np.radians(45)
 _PROJ_SCALE = 0.5          # y-axis compression ratio
 
+# In the oblique projection, the visual silhouette tangent lines of a cylinder
+# are NOT at θ=0/π but shifted by this angle.  Computed from d(px)/dθ = 0.
+_SIL_ALPHA = np.arctan(_PROJ_SCALE * np.cos(_PROJ_ANGLE))   # ≈ 0.34 rad ≈ 19.5°
+
 
 def project(x, y, z):
     """Map a 3-D point to 2-D screen coordinates."""
@@ -61,6 +65,80 @@ def _seg(ax, p3a, p3b, ls="-", lw=0.9, color="k"):
         [a[0], b[0]], [a[1], b[1]],
         ls, color=color, lw=lw,
         solid_capstyle="round", solid_joinstyle="round",
+    )
+
+
+def shade_cylinder_side(ax, cx, cy, cz, radius, height,
+                         light_color="#C5DFF0", dark_color="#5B9DC0",
+                         n_strips=80):
+    """
+    Shade the visible lateral surface of a cylinder with a smooth gradient.
+
+    Uses n_strips thin quadrilateral bands across the front half (θ ∈ [π, 2π]).
+    Colour interpolates from dark_color at the tangent edges to light_color at
+    the foremost centre point, mimicking a diffuse front-lit surface.
+    No visible seam — the entire front side reads as one continuous surface.
+
+    Call BEFORE draw_cylinder() so wireframe edges appear on top.
+    """
+    def _hex_to_rgb(h):
+        h = h.lstrip("#")
+        return tuple(int(h[i:i+2], 16) / 255 for i in (0, 2, 4))
+
+    lc = np.array(_hex_to_rgb(light_color))
+    dc = np.array(_hex_to_rgb(dark_color))
+
+    # Arc runs from the true left silhouette to the true right silhouette,
+    # passing through the foremost point.  Both edges are exactly at the
+    # projected tangent lines drawn by draw_cylinder().
+    a = _SIL_ALPHA
+    t_start = np.pi + a          # left  silhouette (projected leftmost x)
+    t_end   = 2 * np.pi + a      # right silhouette (projected rightmost x)
+    thetas  = np.linspace(t_start, t_end, n_strips + 1)
+
+    for i in range(n_strips):
+        t_a, t_b = thetas[i], thetas[i + 1]
+        t_mid = (t_a + t_b) / 2
+
+        # sin(t - t_start) goes 0 → 1 → 0 symmetrically over [t_start, t_end]
+        factor = float(np.sin(t_mid - t_start))
+        color  = tuple(dc + factor * (lc - dc))
+
+        pts = [
+            project(cx + radius * np.cos(t_a), cy + radius * np.sin(t_a), cz),
+            project(cx + radius * np.cos(t_b), cy + radius * np.sin(t_b), cz),
+            project(cx + radius * np.cos(t_b), cy + radius * np.sin(t_b), cz + height),
+            project(cx + radius * np.cos(t_a), cy + radius * np.sin(t_a), cz + height),
+        ]
+        ax.add_patch(plt.Polygon(pts, facecolor=color, edgecolor="none", zorder=1))
+
+
+def fill_cylinder_top(ax, cx, cy, cz, radius, height, color="#C5DFF0", n=200):
+    """
+    Fill the top circle of the cylinder with a solid colour (default white).
+    This closes the cap visually so the shape reads as a solid cylinder,
+    not an open tube.  Draw AFTER side shading but BEFORE wireframe so the
+    top-circle outline appears on top.
+    """
+    theta = np.linspace(0, 2 * np.pi, n)
+    xs = cx + radius * np.cos(theta)
+    ys = cy + radius * np.sin(theta)
+    pts = [project(x, y, cz + height) for x, y in zip(xs, ys)]
+    poly = plt.Polygon(pts, facecolor=color, edgecolor="none", zorder=1.5)
+    ax.add_patch(poly)
+
+
+def draw_cylinder_axis(ax, cx, cy, cz, height, lw=0.7):
+    """
+    Draw the central axis of the cylinder as a thin dashed line.
+    Runs from the bottom-circle centre to the top-circle centre.
+    Common in Chinese K-12 textbooks to show the axis of rotation.
+    """
+    p_bot = project(cx, cy, cz)
+    p_top = project(cx, cy, cz + height)
+    ax.plot(
+        [p_bot[0], p_top[0]], [p_bot[1], p_top[1]],
+        "--", color="k", lw=lw, zorder=3,
     )
 
 
@@ -167,11 +245,12 @@ def draw_cylinder(ax, cx, cy, cz, radius, height, n=300):
     tx, ty = _proj_circle(cz + height)
     ax.plot(tx, ty, "-", color="k", lw=0.9)
 
-    # Bottom circle – front half solid (y < cy → θ ∈ [π, 2π]),
-    #                 back half dashed  (y > cy → θ ∈ [0, π])
+    # Bottom circle – visible arc solid, hidden arc dashed.
+    # Split at the true projected silhouette angles (not simply θ=0/π).
+    a = _SIL_ALPHA
     for t_range, ls, lw in [
-        (np.linspace(np.pi, 2 * np.pi, n // 2), "-",  0.9),   # front
-        (np.linspace(0,      np.pi,     n // 2), "--", 0.6),   # back
+        (np.linspace(np.pi + a, 2 * np.pi + a, n // 2), "-",  0.9),   # front (visible)
+        (np.linspace(2 * np.pi + a, 3 * np.pi + a, n // 2), "--", 0.6),  # back (hidden)
     ]:
         xs_r = cx + radius * np.cos(t_range)
         ys_r = cy + radius * np.sin(t_range)
@@ -179,9 +258,13 @@ def draw_cylinder(ax, cx, cy, cz, radius, height, n=300):
         py_r = [project(x, y, cz)[1] for x, y in zip(xs_r, ys_r)]
         ax.plot(px_r, py_r, ls, color="k", lw=lw)
 
-    # Left and right tangent lines
-    _seg(ax, (cx - radius, cy, cz), (cx - radius, cy, cz + height))
-    _seg(ax, (cx + radius, cy, cz), (cx + radius, cy, cz + height))
+    # Tangent lines at the true projected silhouette positions
+    xl = cx + radius * np.cos(np.pi + a)
+    yl = cy + radius * np.sin(np.pi + a)
+    xr = cx + radius * np.cos(a)
+    yr = cy + radius * np.sin(a)
+    _seg(ax, (xl, yl, cz), (xl, yl, cz + height))
+    _seg(ax, (xr, yr, cz), (xr, yr, cz + height))
 
     return dict(bottom=(cx, cy, cz), top=(cx, cy, cz + height))
 
@@ -334,18 +417,24 @@ def generate_figure(
     # ── 1. Draw the cuboid wireframe ──────────────────────────────
     v = draw_cuboid(ax, box_length, box_width, box_height)
 
-    # ── 2. Draw the cylinder, centred on the cuboid's top face ────
-    draw_cylinder(ax, cx, cy, cz, cyl_radius, cyl_height)
+    # ── 2. Cylinder fills — all drawn before wireframe so lines sit on top ──
+    shade_cylinder_side(ax, cx, cy, cz, cyl_radius, cyl_height)  # side shading
+    fill_cylinder_top(ax, cx, cy, cz, cyl_radius, cyl_height)    # white cap
 
-    # ── 2b. Re-draw the contact ellipse thicker to show the joint ─
+    # ── 3. Cylinder wireframe + axis ──────────────────────────────
+    draw_cylinder(ax, cx, cy, cz, cyl_radius, cyl_height)
+    draw_cylinder_axis(ax, cx, cy, cz, cyl_height)               # centre axis
+
+    # ── 3b. Re-draw the contact ellipse thicker to show the joint ─
     #   Full bottom circle at z = cz (both visible and hidden arcs)
     n = 300
     theta = np.linspace(0, 2 * np.pi, n)
     xs = cx + cyl_radius * np.cos(theta)
     ys = cy + cyl_radius * np.sin(theta)
+    _a = _SIL_ALPHA
     for t_range, ls in [
-        (np.linspace(np.pi, 2 * np.pi, n // 2), "-"),    # front (visible)
-        (np.linspace(0,      np.pi,     n // 2), "--"),   # back  (hidden)
+        (np.linspace(np.pi + _a, 2 * np.pi + _a, n // 2), "-"),          # front
+        (np.linspace(2 * np.pi + _a, 3 * np.pi + _a, n // 2), "--"),     # back
     ]:
         xs_r = cx + cyl_radius * np.cos(t_range)
         ys_r = cy + cyl_radius * np.sin(t_range)
@@ -353,14 +442,17 @@ def generate_figure(
         py_r = [project(x, y, cz)[1] for x, y in zip(xs_r, ys_r)]
         ax.plot(px_r, py_r, ls, color="k", lw=1.6)   # thicker = emphasis
 
-    # ── 3. Dimension lines ────────────────────────────────────────
+    # ── 4. Dimension lines ────────────────────────────────────────
+
+    DIM_FS = 14   # dimension label font size
+    RAD_FS = 14   # radius / centre-O font size
 
     # Cuboid: length (front-bottom edge  A → B)
     draw_dimension_line(
         ax,
         project(*v["A"]), project(*v["B"]),
         f"長 = {box_length}",
-        perp=(0, -1), gap=1.8,
+        perp=(0, -1), gap=2.5, fontsize=DIM_FS,
     )
 
     # Cuboid: width (right-bottom edge  B → C, goes oblique)
@@ -368,7 +460,7 @@ def generate_figure(
         ax,
         project(*v["B"]), project(*v["C"]),
         f"寬 = {box_width}",
-        perp=(1, -1), gap=1.4,
+        perp=(1, -1), gap=2.0, fontsize=DIM_FS,
     )
 
     # Cuboid: height (front-left vertical  A → E)
@@ -376,17 +468,19 @@ def generate_figure(
         ax,
         project(*v["A"]), project(*v["E"]),
         f"高 = {box_height}",
-        perp=(-1, 0), gap=1.8,
+        perp=(-1, 0), gap=2.5, fontsize=DIM_FS,
     )
 
-    # Cylinder: height (right tangent of cylinder, vertical)
-    p_cyl_bot = project(cx + cyl_radius, cy, cz)
-    p_cyl_top = project(cx + cyl_radius, cy, cz + cyl_height)
+    # Cylinder: height – placed at the true right silhouette tangent
+    _xr = cx + cyl_radius * np.cos(_SIL_ALPHA)
+    _yr = cy + cyl_radius * np.sin(_SIL_ALPHA)
+    p_cyl_bot = project(_xr, _yr, cz)
+    p_cyl_top = project(_xr, _yr, cz + cyl_height)
     draw_dimension_line(
         ax,
         p_cyl_bot, p_cyl_top,
         f"高 = {cyl_height}",
-        perp=(1, 0), gap=1.8,
+        perp=(1, 0), gap=2.5, fontsize=DIM_FS,
     )
 
     # Cylinder: radius on the top circle (fully visible), going rightward
@@ -397,6 +491,7 @@ def generate_figure(
         angle_deg=0,
         label=f"r = {cyl_radius}",
         center_label="O",
+        fontsize=RAD_FS,
     )
 
     # ── 4. Title ──────────────────────────────────────────────────
