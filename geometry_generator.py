@@ -373,134 +373,247 @@ def draw_pyramid(ax, base_length, base_width, height,
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  MULTI-OBJECT HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _validate_object(obj, box_length, box_width):
+    """Warn if an object's footprint exceeds the box top-face boundary."""
+    t = obj.get("type", "?")
+    if t == "cylinder":
+        cx, cy, r = obj["cx"], obj["cy"], obj["radius"]
+        outside = (cx - r < 0 or cx + r > box_length or
+                   cy - r < 0 or cy + r > box_width)
+    elif t == "cuboid":
+        ox, oy = obj["ox"], obj["oy"]
+        outside = (ox < 0 or ox + obj["length"] > box_length or
+                   oy < 0 or oy + obj["width"]  > box_width)
+    else:
+        print(f"[warning] unknown object type '{t}'")
+        return
+    if outside:
+        print(f"[warning] {t} {obj} extends outside the box top face")
+
+
+def _depth_key(obj):
+    """Painter's-algorithm sort key: back objects (higher y) drawn first."""
+    if obj["type"] == "cylinder":
+        return -(obj["cy"] + obj["radius"])
+    return -(obj["oy"] + obj["width"])
+
+
+def _draw_object(ax, obj, base_z):
+    """Draw shading + wireframe + contact mark for one object on the box top."""
+    if obj["type"] == "cylinder":
+        cx, cy = obj["cx"], obj["cy"]
+        r,  h  = obj["radius"], obj["height"]
+        cz     = base_z
+
+        # Shading (must come before wireframe)
+        shade_cylinder_side(ax, cx, cy, cz, r, h)
+        fill_cylinder_top(ax, cx, cy, cz, r, h)
+
+        # Wireframe + centre axis
+        draw_cylinder(ax, cx, cy, cz, r, h)
+        draw_cylinder_axis(ax, cx, cy, cz, h)
+
+        # Contact ellipse – redraw thicker to mark the joint
+        a = _SIL_ALPHA
+        n = 200
+        for t_range, ls in [
+            (np.linspace(np.pi + a, 2*np.pi + a, n // 2), "-"),
+            (np.linspace(2*np.pi + a, 3*np.pi + a, n // 2), "--"),
+        ]:
+            xs_r = cx + r * np.cos(t_range)
+            ys_r = cy + r * np.sin(t_range)
+            ax.plot(
+                [project(x, y, cz)[0] for x, y in zip(xs_r, ys_r)],
+                [project(x, y, cz)[1] for x, y in zip(xs_r, ys_r)],
+                ls, color="k", lw=1.6,
+            )
+
+    elif obj["type"] == "cuboid":
+        ox, oy = obj["ox"], obj["oy"]
+        L, W, H = obj["length"], obj["width"], obj["height"]
+        cz = base_z
+
+        # Shade top face and front face before wireframe
+        fill_face_2d(ax, [                          # top face
+            (ox,     oy,     cz + H),
+            (ox + L, oy,     cz + H),
+            (ox + L, oy + W, cz + H),
+            (ox,     oy + W, cz + H),
+        ], color="#c0c0c0", alpha=0.55, zorder=1)
+        fill_face_2d(ax, [                          # front face
+            (ox,     oy, cz),
+            (ox + L, oy, cz),
+            (ox + L, oy, cz + H),
+            (ox,     oy, cz + H),
+        ], color="#d8d8d8", alpha=0.45, zorder=1)
+
+        draw_cuboid(ax, L, W, H, ox=ox, oy=oy, oz=cz)
+
+
+def _draw_object_labels(ax, obj, base_z, fontsize=14):
+    """Draw dimension annotations for one object."""
+    if obj["type"] == "cylinder":
+        cx, cy = obj["cx"], obj["cy"]
+        r,  h  = obj["radius"], obj["height"]
+        cz     = base_z
+
+        # Height: along the true right silhouette tangent
+        xr = cx + r * np.cos(_SIL_ALPHA)
+        yr = cy + r * np.sin(_SIL_ALPHA)
+        draw_dimension_line(
+            ax,
+            project(xr, yr, cz), project(xr, yr, cz + h),
+            f"高 = {h}",
+            perp=(1, 0), gap=2.5, fontsize=fontsize,
+        )
+        # Radius on the top circle
+        draw_radius_line(
+            ax,
+            center_3d=(cx, cy, cz + h),
+            radius=r,
+            angle_deg=obj.get("label_angle", 0),
+            label=f"r = {r}",
+            center_label="O",
+            fontsize=fontsize,
+        )
+
+    elif obj["type"] == "cuboid":
+        ox, oy = obj["ox"], obj["oy"]
+        L, W, H = obj["length"], obj["width"], obj["height"]
+        cz = base_z
+        A = (ox,     oy,     cz)
+        B = (ox + L, oy,     cz)
+        C = (ox + L, oy + W, cz)
+        E = (ox,     oy,     cz + H)
+        draw_dimension_line(ax, project(*A), project(*B),
+                            f"長 = {L}", perp=(0, -1), gap=2.0, fontsize=fontsize)
+        draw_dimension_line(ax, project(*B), project(*C),
+                            f"寬 = {W}", perp=(1, -1), gap=1.5, fontsize=fontsize)
+        draw_dimension_line(ax, project(*A), project(*E),
+                            f"高 = {H}", perp=(-1, 0), gap=2.0, fontsize=fontsize)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  MAIN SCENE BUILDER
 # ═════════════════════════════════════════════════════════════════════════════
 
 def generate_figure(
-    box_length  = 20,
-    box_width   = 12,
-    box_height  =  6,
-    cyl_radius  =  5,
-    cyl_height  =  8,
-    filename    = "geometry_figure.png",
-    dpi         = 150,
-    show        = True,
+    box_length = 20,
+    box_width  = 12,
+    box_height =  6,
+    objects    = None,   # list of shape dicts placed on the box top face
+    filename   = "geometry_figure.png",
+    dpi        = 150,
+    show       = True,
 ):
     """
-    Generate a composite long-cuboid + cylinder diagram.
+    Generate a geometry diagram: a cuboid base with one or more shapes on top.
 
-    All parameters are independent so you can pass different values
-    to auto-generate different exam-question variants:
+    objects
+    -------
+    List of dicts.  Each dict must include a ``'type'`` key.
 
-        generate_figure(box_length=24, box_width=10, box_height=8,
-                        cyl_radius=4, cyl_height=10,
-                        filename="variant2.png")
+    Cylinder::
+
+        {'type': 'cylinder',
+         'cx': x, 'cy': y,          # centre on the box top face
+         'radius': r, 'height': h,
+         'show_labels': True,        # optional, default True
+         'label_angle': 0}           # radius-line direction (degrees)
+
+    Small cuboid::
+
+        {'type': 'cuboid',
+         'ox': x, 'oy': y,           # front-left corner on the box top face
+         'length': L, 'width': W, 'height': H,
+         'show_labels': True}         # optional
+
+    If *objects* is ``None``, defaults to a single centred cylinder (r=5, h=8).
+
+    Examples
+    --------
+    Two cylinders of different sizes::
+
+        generate_figure(
+            box_length=20, box_width=12, box_height=6,
+            objects=[
+                {'type': 'cylinder', 'cx': 6,  'cy': 6, 'radius': 3, 'height': 10},
+                {'type': 'cylinder', 'cx': 15, 'cy': 6, 'radius': 2, 'height': 6,
+                 'label_angle': 45},
+            ],
+            filename="multi_cylinder.png",
+        )
+
+    One cylinder + one small cuboid::
+
+        generate_figure(
+            box_length=20, box_width=12, box_height=6,
+            objects=[
+                {'type': 'cylinder', 'cx': 5,  'cy': 6, 'radius': 3, 'height': 8},
+                {'type': 'cuboid',   'ox': 11, 'oy': 3,
+                 'length': 6, 'width': 5, 'height': 5},
+            ],
+            filename="mixed.png",
+        )
     """
+    # ── Defaults ──────────────────────────────────────────────────
+    if objects is None:
+        objects = [dict(type="cylinder",
+                        cx=box_length / 2, cy=box_width / 2,
+                        radius=5, height=8)]
+
+    for obj in objects:
+        _validate_object(obj, box_length, box_width)
+
     fig, ax = plt.subplots(figsize=(12, 9))
     ax.set_aspect("equal")
     ax.axis("off")
 
-    cx = box_length / 2
-    cy = box_width  / 2
-    cz = box_height
+    cz = box_height   # z-level of the box top face
 
-    # ── 0. Shading: fill top face BEFORE wireframe (stays behind lines) ──
-    #   Top face corners in 3-D order: E → F → G → H
-    top_face = [
-        (0,            0,           cz),   # E  front-left
-        (box_length,   0,           cz),   # F  front-right
-        (box_length,   box_width,   cz),   # G  back-right
-        (0,            box_width,   cz),   # Hv back-left
-    ]
-    fill_face_2d(ax, top_face, color="#c8c8c8", alpha=0.40)
+    # ── 0. Box top-face shading ───────────────────────────────────
+    fill_face_2d(ax, [
+        (0,          0,         cz),
+        (box_length, 0,         cz),
+        (box_length, box_width, cz),
+        (0,          box_width, cz),
+    ], color="#c8c8c8", alpha=0.40)
 
-    # ── 1. Draw the cuboid wireframe ──────────────────────────────
+    # ── 1. Cuboid base wireframe ──────────────────────────────────
     v = draw_cuboid(ax, box_length, box_width, box_height)
 
-    # ── 2. Cylinder fills — all drawn before wireframe so lines sit on top ──
-    shade_cylinder_side(ax, cx, cy, cz, cyl_radius, cyl_height)  # side shading
-    fill_cylinder_top(ax, cx, cy, cz, cyl_radius, cyl_height)    # white cap
+    # ── 2. Objects – back to front (painter's algorithm) ─────────
+    for obj in sorted(objects, key=_depth_key):
+        _draw_object(ax, obj, cz)
 
-    # ── 3. Cylinder wireframe + axis ──────────────────────────────
-    draw_cylinder(ax, cx, cy, cz, cyl_radius, cyl_height)
-    draw_cylinder_axis(ax, cx, cy, cz, cyl_height)               # centre axis
+    # ── 3. Base cuboid dimension lines ────────────────────────────
+    DIM_FS = 14
+    draw_dimension_line(ax, project(*v["A"]), project(*v["B"]),
+                        f"長 = {box_length}", perp=(0, -1), gap=2.5, fontsize=DIM_FS)
+    draw_dimension_line(ax, project(*v["B"]), project(*v["C"]),
+                        f"寬 = {box_width}",  perp=(1, -1), gap=2.0, fontsize=DIM_FS)
+    draw_dimension_line(ax, project(*v["A"]), project(*v["E"]),
+                        f"高 = {box_height}", perp=(-1, 0), gap=2.5, fontsize=DIM_FS)
 
-    # ── 3b. Re-draw the contact ellipse thicker to show the joint ─
-    #   Full bottom circle at z = cz (both visible and hidden arcs)
-    n = 300
-    theta = np.linspace(0, 2 * np.pi, n)
-    xs = cx + cyl_radius * np.cos(theta)
-    ys = cy + cyl_radius * np.sin(theta)
-    _a = _SIL_ALPHA
-    for t_range, ls in [
-        (np.linspace(np.pi + _a, 2 * np.pi + _a, n // 2), "-"),          # front
-        (np.linspace(2 * np.pi + _a, 3 * np.pi + _a, n // 2), "--"),     # back
-    ]:
-        xs_r = cx + cyl_radius * np.cos(t_range)
-        ys_r = cy + cyl_radius * np.sin(t_range)
-        px_r = [project(x, y, cz)[0] for x, y in zip(xs_r, ys_r)]
-        py_r = [project(x, y, cz)[1] for x, y in zip(xs_r, ys_r)]
-        ax.plot(px_r, py_r, ls, color="k", lw=1.6)   # thicker = emphasis
+    # ── 4. Per-object dimension lines ─────────────────────────────
+    for obj in objects:
+        if obj.get("show_labels", True):
+            _draw_object_labels(ax, obj, cz, fontsize=DIM_FS)
 
-    # ── 4. Dimension lines ────────────────────────────────────────
-
-    DIM_FS = 14   # dimension label font size
-    RAD_FS = 14   # radius / centre-O font size
-
-    # Cuboid: length (front-bottom edge  A → B)
-    draw_dimension_line(
-        ax,
-        project(*v["A"]), project(*v["B"]),
-        f"長 = {box_length}",
-        perp=(0, -1), gap=2.5, fontsize=DIM_FS,
+    # ── 5. Title ──────────────────────────────────────────────────
+    _name = {"cylinder": "圓柱體", "cuboid": "長方體"}
+    top_shapes = "、".join(
+        dict.fromkeys(_name.get(o["type"], o["type"]) for o in objects)
     )
-
-    # Cuboid: width (right-bottom edge  B → C, goes oblique)
-    draw_dimension_line(
-        ax,
-        project(*v["B"]), project(*v["C"]),
-        f"寬 = {box_width}",
-        perp=(1, -1), gap=2.0, fontsize=DIM_FS,
-    )
-
-    # Cuboid: height (front-left vertical  A → E)
-    draw_dimension_line(
-        ax,
-        project(*v["A"]), project(*v["E"]),
-        f"高 = {box_height}",
-        perp=(-1, 0), gap=2.5, fontsize=DIM_FS,
-    )
-
-    # Cylinder: height – placed at the true right silhouette tangent
-    _xr = cx + cyl_radius * np.cos(_SIL_ALPHA)
-    _yr = cy + cyl_radius * np.sin(_SIL_ALPHA)
-    p_cyl_bot = project(_xr, _yr, cz)
-    p_cyl_top = project(_xr, _yr, cz + cyl_height)
-    draw_dimension_line(
-        ax,
-        p_cyl_bot, p_cyl_top,
-        f"高 = {cyl_height}",
-        perp=(1, 0), gap=2.5, fontsize=DIM_FS,
-    )
-
-    # Cylinder: radius on the top circle (fully visible), going rightward
-    draw_radius_line(
-        ax,
-        center_3d=(cx, cy, cz + cyl_height),
-        radius=cyl_radius,
-        angle_deg=0,
-        label=f"r = {cyl_radius}",
-        center_label="O",
-        fontsize=RAD_FS,
-    )
-
-    # ── 4. Title ──────────────────────────────────────────────────
     ax.set_title(
-        "複合立體幾何示意圖　（長方體 + 圓柱體）",
+        f"複合立體幾何示意圖　（長方體底座 ＋ {top_shapes}）",
         fontsize=13, pad=22,
     )
 
-    # ── 5. Save / show ────────────────────────────────────────────
+    # ── 6. Save / show ────────────────────────────────────────────
     plt.tight_layout()
     fig.savefig(filename, dpi=dpi, bbox_inches="tight", facecolor="white")
     print(f"✓ 圖形已儲存為 {filename}")
@@ -511,21 +624,40 @@ def generate_figure(
 
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # ── Default parameters (matches the problem statement) ────────
+    # ── Example 1: single centred cylinder (original problem) ─────
     generate_figure(
-        box_length = 20,
-        box_width  = 12,
-        box_height =  6,
-        cyl_radius =  5,
-        cyl_height =  8,
-        filename   = "geometry_figure.png",
-        dpi        = 150,
-        show       = True,
+        box_length=20, box_width=12, box_height=6,
+        objects=[
+            {"type": "cylinder", "cx": 10, "cy": 6, "radius": 5, "height": 8},
+        ],
+        filename="geometry_figure.png",
+        show=False,
     )
 
-    # ── Uncomment to produce a different variant ──────────────────
-    # generate_figure(
-    #     box_length=30, box_width=15, box_height=8,
-    #     cyl_radius=6, cyl_height=10,
-    #     filename="variant_large.png",
-    # )
+    # ── Example 2: two cylinders of different sizes ───────────────
+    generate_figure(
+        box_length=20, box_width=12, box_height=6,
+        objects=[
+            {"type": "cylinder", "cx": 6,  "cy": 6, "radius": 3, "height": 10,
+             "label_angle": 170},
+            {"type": "cylinder", "cx": 15, "cy": 6, "radius": 2, "height": 6,
+             "label_angle": 0},
+        ],
+        filename="geometry_figure_multi_cyl.png",
+        show=False,
+    )
+
+    # ── Example 3: cylinder + small cuboid ───────────────────────
+    generate_figure(
+        box_length=20, box_width=12, box_height=6,
+        objects=[
+            {"type": "cylinder", "cx": 5,  "cy": 6, "radius": 3, "height": 8,
+             "label_angle": 180},
+            {"type": "cuboid",   "ox": 10, "oy": 3,
+             "length": 7, "width": 5, "height": 5},
+        ],
+        filename="geometry_figure_mixed.png",
+        show=False,
+    )
+
+    print("全部圖形已產生完畢。")
